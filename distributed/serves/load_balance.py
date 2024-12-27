@@ -14,15 +14,19 @@ class ConsistentHashLoadBalancer:
 
     def add_server(self, server_id):
         # 添加服务器的虚拟节点
-        for i in range(self.replicas_node_count):
-            # 为每个服务器创建虚拟节点
-            virtual_node = f"{server_id}:{i}"
-            hash_value = self._hash(virtual_node)
-            # 将虚拟节点添加到哈希环
-            self.ring.append(hash_value)
-            self.hash_server_dict[hash_value] = server_id
-        # 保持哈希环有序
-        self.ring.sort()
+        try:
+            for i in range(self.replicas_node_count):
+                # 为每个服务器创建虚拟节点
+                virtual_node = f"{server_id}:{i}"
+                hash_value = self._hash(virtual_node)
+                # 将虚拟节点添加到哈希环
+                self.ring.append(hash_value)
+                self.hash_server_dict[hash_value] = server_id
+            # 保持哈希环有序
+            self.ring.sort()
+        except Exception as e:
+            # 其他异常也可以处理
+            print(f"'add_server': {e}")
 
     def remove_server(self, server_id):
         # 移除服务器节点
@@ -48,33 +52,14 @@ class ConsistentHashLoadBalancer:
         index = bisect.bisect_left(self.ring, hash_value)
         if index == len(self.ring):
             index = 0  # 如果到达环的末尾，回到环的开头
-            # 获取顺延的 num_servers 个节点，包括自己
-        servers = []
-        visited = set()  # 用于记录已经添加的节点
-
-        # 从当前节点开始，查找顺延的 num_servers 个节点，直到找到足够的不同节点
-        while len(servers) < self.copy_num:
-            node = self.ring[(index + len(servers)) % len(self.ring)]
-            # 确保节点不重复
-            if node not in visited:
-                visited.add(node)
-                servers.append(self.hash_server_dict[node])
-        return servers
+            # 获取顺延的 num_servers 个节点，包括自己/
+        node=self.ring[index]
+        return self.hash_server_dict[node]
 
     def replace_node(self, old_node, new_node):
         self.remove_server(old_node)
         self.add_server(new_node)
 
-    def get_files_to_migrate(self,files,node_id):
-        files_to_migrate = []
-        for file_path in files:
-            # 获取当前文件的服务器
-            current_server = self.get_server(file_path)
-            if current_server == node_id:
-                # 如果文件当前存储在需要迁移的节点上
-                files_to_migrate.append(file_path)
-
-        return files_to_migrate
 
     def get_next_server(self, dead_node_id):
         """获取死节点后一个节点"""

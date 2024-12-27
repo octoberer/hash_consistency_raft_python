@@ -1,7 +1,7 @@
 
 import numpy as np
 import time
-from lru import lru_cache
+from lfu import lru_cache
 # import multiprocessing
 from multiprocessing import Pool
 

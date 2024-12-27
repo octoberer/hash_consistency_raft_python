@@ -2,10 +2,10 @@ import json
 import os
 import random
 
-from lru import lru_cache
+from lfu import lfu_cache
 k = 1
 m = 60
-my_lru_cache = lru_cache(k)
+my_lru_cache = lfu_cache(k)
 my_lru_cache.schedule_exit(m)
 all_operation=['add','update','get','delete']
 def add(file_path,properties_dict):

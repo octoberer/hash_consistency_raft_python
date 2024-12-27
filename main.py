@@ -2,33 +2,7 @@
 import os
 import time
 
-class SnowflakeIdWorker:
-    tw_epoch = 1288834974657
-    def __init__(self, datacenter_id, worker_id):
-        self.datacenter_id = datacenter_id
-        self.worker_id = worker_id
-        self.sequence = 0
-        self.last_timestamp = -1
 
-    def time_gen(self):
-        return int(time.time() * 1000)
-
-    def til_nextMillis(self, last_timestamp):
-        timestamp = self.time_gen()
-        while timestamp <= last_timestamp:
-            timestamp = self.time_gen()
-        return timestamp
-
-    def get_id(self):
-        timestamp = self.time_gen()
-        if self.last_timestamp == timestamp:
-            self.sequence = self.sequence + 1
-            if self.sequence > 4095:
-                timestamp = self.til_nextMillis(self.last_timestamp)
-        else:
-            self.sequence = 0
-        self.last_timestamp = timestamp
-        return ((timestamp - self.tw_epoch) << 22) | (self.datacenter_id << 12) | (self.worker_id << 6) | self.sequence
 
 def saveFileId(file_path,datacenter_id,worker_id):
         with open(file_path, 'rb') as file:
