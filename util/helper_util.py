@@ -6,18 +6,18 @@ import re
 import aiofiles
 import psutil
 
-from operate_file import serve_num
+from util.settings import serve_num
 
 
 def create_log_file(entry):
     # 从 entry 中提取必要信息
     temp_content = entry.get('properties_dict','')  # 获取 temp_content
-    client_id = entry.get('client', None)  # 获取 client
+    client_id = entry.get('communicate', None)  # 获取 communicate
     # 创建日志条目字典
     log_entry = json.dumps({
         **entry,
         "properties_dict": temp_content,  # 转换为 JSON 字符串
-        "client_id": client_id,  # 使用 client.client_id
+        "client_id": client_id,  # 使用 communicate.client_id
     })
 
     return log_entry

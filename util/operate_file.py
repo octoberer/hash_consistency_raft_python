@@ -1,13 +1,7 @@
-import asyncio
-import re
+
 import os
 import json
 import aiofiles
-
-serve_num=5
-
-
-
 
 # 异步添加文件
 async def add_file(file_path, properties_dict, server_id):

@@ -4,11 +4,11 @@ import time
 
 import psutil
 
-from distributed.my_raft import RaftNode, FakeNode
-from distributed.operate_file import serve_num
-from distributed.serves.SnowflakeIdWorker import SnowflakeIdWorker
-from distributed.serves.load_balance import ConsistentHashLoadBalancer
-from distributed.serves.resolve_client import resolve_client
+from my_raft import RaftNode, FakeNode
+from util.operate_file import serve_num
+from util.SnowflakeIdWorker import SnowflakeIdWorker
+from util.load_balance import ConsistentHashLoadBalancer
+from util.resolve_client import resolve_client
 
 from enum import Enum
 
@@ -28,12 +28,11 @@ class RequestStatus(Enum):
 
 
 class Mediator():
-    def __init__(self, queues_dict):
+    def __init__(self):
         self.new_queue = None
         self.remove_node_id = None
         self.new_node_id = None
         self.current_term = -1
-        self.queues_dict = queues_dict
         self.pending_task_dict = {}
         self.leader_id = None
         self.send_msg_interval = 0.05
@@ -139,7 +138,7 @@ class Mediator():
         msg_type = msg[0]
         if msg_type.startswith("server"):
             self.process_servers_message(msg)
-        elif msg_type.startswith("client"):
+        elif msg_type.startswith("communicate"):
             await self.process_clients_message(msg)
         elif msg_type == 'replicate_logs_request':
             # pass
@@ -229,7 +228,7 @@ class Mediator():
         try:
             msg_type = msg[0]
             if msg_type == 'client_send_msg':
-                print('中间层收到了一条消息')
+                # print('中间层收到了一条消息')
                 _, client_id, message, timestamp = msg
                 await self.send_msg(client_id, message, timestamp)
         except Exception as e:

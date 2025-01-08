@@ -7,7 +7,6 @@ class ConsistentHashLoadBalancer:
         self.hash_server_dict = {}  # 真实服务器节点
         self.ring = []  # 哈希环，存储虚拟节点的哈希值
         self.files = {}  # 存储文件路径 -> 文件信息（例如文件路径对应的哈希值等）
-        self.copy_num=copy_num
     def _hash(self, key):
         # 使用MD5哈希算法计算哈希值
         return int(hashlib.md5(key.encode()).hexdigest(), 16)
@@ -18,6 +17,7 @@ class ConsistentHashLoadBalancer:
             for i in range(self.replicas_node_count):
                 # 为每个服务器创建虚拟节点
                 virtual_node = f"{server_id}:{i}"
+
                 hash_value = self._hash(virtual_node)
                 # 将虚拟节点添加到哈希环
                 self.ring.append(hash_value)
@@ -64,8 +64,9 @@ class ConsistentHashLoadBalancer:
     def get_next_server(self, dead_node_id):
         """获取死节点后一个节点"""
         # 获取死节点的哈希值
+        if not isinstance(dead_node_id,str):
+            dead_node_id=str(dead_node_id)
         dead_node_hash = self._hash(dead_node_id)
-
         # 使用二分查找找到下一个大于dead_node_hash的节点
         index = bisect.bisect_right(self.ring, dead_node_hash)
 
@@ -95,13 +96,6 @@ class ConsistentHashLoadBalancer:
         last_node_hash = self.ring[index]
         return self.hash_server_dict[last_node_hash]
 
-    def get_need_translate_nodes(self,new_node_id):
-        s=[]
-        t=new_node_id
-        for i in range(0,self.copy_num):
-            t=self.get_next_server(t)
-            s.append(t)
-        return s
     def is_last_copy(self,file_path,node_id):
         return node_id== self.get_server(file_path)[-1]
 

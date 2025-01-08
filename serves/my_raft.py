@@ -1,36 +1,46 @@
 import json
 import os
 import queue
-import subprocess
 import time
 import random
 
 import aiofiles
 import asyncio
+
+from util.settings import client1_address, address
 from util.operate_file import add_file, delete_file, update_file
 from util.resolve_client import resolve_client
-from util import create_log_file, save_config
+from util.helper_util import create_log_file, save_config
 from util.lfu_cache import lfu_cache
 
+
 class FakeNode():
-    def __init__(self,node_id):
-        if isinstance(node_id,str):
-            self.id = str(node_id)
-        else:
-            self.id= 'server' + str(node_id)
+    def __init__(self, node_id):
+        self.id = node_id
+
+
+async def handle_task_result(task):
+    try:
+        task.result()  # 如果任务有异常，这里会抛出
+    except Exception as e:
+        print(f"异步任务出错: {e}")
+
 
 class RaftCore:
-    def __init__(self, node_id, queues_dict):
-        self.sibling_pids_dict = {}
+    def __init__(self, node_id, server, is_new):
+        self.is_dead = False
+        self.resolve_follower_replicate_response_lock = asyncio.Lock()
+        self.send_vote_lock = asyncio.Lock()
+        self.server = server
         self.append_log_lock = asyncio.Lock()
-        self.replicate_to_follower_lock =  asyncio.Lock()
+        self.replicate_to_follower_lock = asyncio.Lock()
         self.append_entries_lock = asyncio.Lock()
-        self.last_heart_time = 0
         self.apply_lock = asyncio.Lock()
         self.run_loop = None
-        self.current_votes_received = []
+        # {id:flag}
+        self.current_votes_received = {}
         self.leader_id = None
-        self.id = 'server' + str(node_id)
+        self.id = node_id
         # 村粗所有主机id
         self.peers = []
         self.state = 'FOLLOWER'
@@ -49,24 +59,42 @@ class RaftCore:
         self.heartbeat_timeout = 0.05
         self.heartbeat_success_received = asyncio.Event()
         self.heartbeat_received = asyncio.Event()
-        self.queues_dict = queues_dict
+        self.is_new = is_new
 
-    def become_candidate(self):
-        print(f'{self.id}变为become_candidate')
-        self.state = 'CANDIDATE'
-        self.current_term += 1
-        self.current_votes_received.append(True)
-        self.voted_for = self.id
-        self.leader_id = None
-        last_log_index = self.log[-1]['index'] if len(self.log) > 0 else -1
-        last_log_term = self.log[-1]['term'] if len(self.log) > 0 else -1
-        for peer in self.peers:
-            if peer.id != self.id:
-                self.queues_dict[peer.id].put(
-                    ('vote_request', self.current_term, self.id, last_log_index, last_log_term))
+    def set_peers(self, peers):
+        self.peers = peers
+
+    async def become_candidate(self):
+        try:
+            self.state = 'CANDIDATE'
+            self.current_term += 1
+            self.current_votes_received[self.id] = True
+            self.voted_for = self.id
+            print(f'{self.id}变为become_candidate，给任期{self.current_term}投票自己')
+            self.leader_id = None
+            last_log_index = self.log[-1]['index'] if len(self.log) > 0 else -1
+            last_log_term = self.log[-1]['term'] if len(self.log) > 0 else -1
+            # 创建任务列表
+            for peer in self.peers:
+                if peer.id != self.id:
+                    task = asyncio.create_task(
+                        self.send_vote_request_to_peer(peer.id, self.current_term, last_log_index, last_log_term)
+                    )
+                    task.add_done_callback(lambda t: asyncio.create_task(handle_task_result(t)))
+        except Exception as e:
+            print(f'become_candidate里的错误', e)
+
+    async def send_vote_request_to_peer(self, follower_id, old_term, last_log_index, last_log_term):
+        while self.state == 'CANDIDATE' and follower_id not in self.current_votes_received and old_term == self.current_term:
+            print(f"{self.id}向{follower_id}发送投票请求")
+            await self.put_message_to_host(
+                follower_id,
+                ('vote_request', self.current_term, self.id, last_log_index, last_log_term)
+            )
+            await asyncio.sleep(self.heartbeat_timeout)
 
     async def start_leader(self):
-        print("start_leader", self.id, "voted_for", self.voted_for)
+        print(f"start_leader, {self.id}==>在{self.current_term}期")
         self.leader_id = self.id
         self.state = 'LEADER'
         for node in self.peers:
@@ -78,27 +106,16 @@ class RaftCore:
 
     async def start_heartbeat(self):
         while self.state == 'LEADER':
-            # print(self.id,'领导我发送心跳一次！！！！！！！！！！！！！！！！')
+            # print('发送一次心跳')
+            # 为所有节点创建并发任务
             for peer in self.peers:
-                # print(f'peer:{peer}---leader发送心跳信号，同步日志')
                 if self.id != peer.id:
-                    self.replicate_to_follower(peer.id)
-            self.queues_dict['Mediator'].put(('replicate_logs_request', self.current_term, self.leader_id,self.commit_index))
-            # self.queues_dict['client_1'].put(
-            #     ('server_send_response', self.current_term, self.leader_id, self.commit_index))
+                    asyncio.create_task(self.replicate_to_follower(peer.id))
+            # 添加 Mediator 的消息任务
+            asyncio.create_task(self.put_message_to_host('Mediator',
+                                                         ('replicate_logs_request', self.current_term, self.leader_id,
+                                                          self.commit_index)))
             await asyncio.sleep(self.heartbeat_timeout)
-
-    def resolve_heartbeat_response(self, response):
-        if response:
-            term = response.get('term', self.current_term)
-            # print(f'&&&&resolve_heartbeat_response:{term}--{self.current_term}')
-            if term > self.current_term:
-                # Follower比自己的任期还大，将自己身份转为FOLLOWER，不再发送给其他主机心跳，等待下一轮选举发生
-                self.current_term = term
-                self.state = 'FOLLOWER'
-                return
-            else:
-                pass
 
     async def replicate_logs(self, temp_log=None):
         print("replicate_logs*************")
@@ -113,61 +130,63 @@ class RaftCore:
                     self.next_index[peer.id] = len(self.log)
                     # print(f'更新{peer.id}的主机的next_index为{len(self.log)}')
             # 后续会随着心跳将日志发过去
+            if len(self.log) > 0:
+                for peer in self.peers:
+                    if self.id != peer.id:
+                        leader_next_index = self.next_index[peer.id]
+                        # print(f'leader新增一个日志')
+                        asyncio.create_task(self.replicate_to_follower(peer.id, leader_next_index))
 
     async def send_append_entries(self, leader_term, leader_id, leader_prev_log_index, leader_prev_log_term, entries,
                                   leader_commit_index):
-
-        async with self.append_entries_lock:
-            try:
+        try:
+            # print(f'leader_prev_log_index：{leader_prev_log_index},entries:{entries}')
+            async with self.append_entries_lock:
                 response = {
                     'term': self.current_term,
                     'success': False,
                     'conflict_index': None,
                     "follower_id": self.id,
                 }
-
+                # print(f'{self.id[1]}接收到了{leader_id[1]}发送的心跳信号，同步日志')
                 if leader_term < self.current_term:
-                    print(f'leader_term:{leader_term},self.current_term:{self.current_term}')
-                    self.queues_dict[leader_id].put(('replicate_logs_response', response))
-                    return
-                # print(f'{self.id}self.heartbeat_received.set()')
-                self.heartbeat_received.set()
-                self.heartbeat_received.clear()
-                self.current_term = leader_term
-                # print(f'更改leader为{leader_id}')
-                self.leader_id = leader_id
-                self.state = 'FOLLOWER'
-                self.voted_for = None
-                last_log_index = len(self.log) - 1
-                # print(f'3333333:{entries}')
-                if last_log_index >= leader_prev_log_index >= 0 and self.log[leader_prev_log_index][
-                    'term'] != leader_prev_log_term:
-                    # 如果同样index的项，term不一致也会产生冲突
-                    response['conflict_index'] = leader_prev_log_index
-                    self.queues_dict[leader_id].put(('replicate_logs_response', response))
-                    return
-                elif leader_prev_log_index > last_log_index:
-                    response['conflict_index'] = max(0, last_log_index + 1)
-                    self.queues_dict[leader_id].put(('replicate_logs_response', response))
-                    return
-                # 其他情况：如果leader_prev_log_index为-1，直接复制entries
-                # 找到最大共同index了，开始同步entries
-                if len(entries) > 0:
-                    if leader_prev_log_index + 1 < len(self.log):
-                        del self.log[leader_prev_log_index + 1:]
-                    self.log.extend(entries)
-                response['success'] = True
-                self.queues_dict[leader_id].put(('replicate_logs_response', response))
-
-                if self.commit_index < leader_commit_index:
-                    self.commit_index = leader_commit_index
-            except Exception as e:
+                    # print(f'leader_term:{leader_term},self.current_term:{self.current_term}')
+                    pass
+                else:
+                    # print(f'{self.id}self.heartbeat_received.set()')
+                    self.heartbeat_received.set()
+                    self.heartbeat_received.clear()
+                    self.current_term = leader_term
+                    # print(f'更改leader为{leader_id}')
+                    self.leader_id = leader_id
+                    self.state = 'FOLLOWER'
+                    self.voted_for = None
+                    last_log_index = len(self.log) - 1
+                    if last_log_index >= leader_prev_log_index >= 0 and self.log[leader_prev_log_index][
+                        'term'] != leader_prev_log_term:
+                        # 如果同样index的项，term不一致也会产生冲突
+                        response['conflict_index'] = leader_prev_log_index
+                    elif leader_prev_log_index > last_log_index:
+                        response['conflict_index'] = max(0, last_log_index + 1)
+                        # print(f"conflict_index:{response['conflict_index']}")
+                    # 其他情况：如果leader_prev_log_index为-1，直接复制entries
+                    # 找到最大共同index了，开始同步entries
+                    elif len(entries) > 0:
+                        if leader_prev_log_index + 1 < len(self.log):
+                            del self.log[leader_prev_log_index + 1:]
+                        self.log.extend(entries)
+                        # print(f'entries增加了:{entries}')
+                        response['success'] = True
+                    if self.commit_index < leader_commit_index:
+                        self.commit_index = leader_commit_index
+                    asyncio.create_task(self.applied_by_commitIndex(self.commit_index))
+        except Exception as e:
             # 其他异常也可以处理
-                print(f"send_append_entries函数里的错误: {e}")
+            print(f"send_append_entries函数里的错误: {e}")
+        asyncio.create_task(self.put_message_to_host(leader_id, ('replicate_logs_response', response)))
+        # print(f"其他主机applied_by_commitIndex: {self.commit_index}")
 
-        await self.applied_by_commitIndex(self.commit_index)
-
-    async def save_log_file(self, entry,commit_index):
+    async def save_log_file(self, entry, commit_index):
         entry.pop('queues_dict', None)
         # 创建日志条目
         real_entry = create_log_file(entry)
@@ -182,7 +201,7 @@ class RaftCore:
         await save_config({"commit_index": commit_index, "applied_index": self.applied_index},
                           state_file_path)
 
-    async def applied_by_commitIndex(self,commit_index, max_retries=5):
+    async def applied_by_commitIndex(self, commit_index, max_retries=5):
         retries = 0
         while self.applied_index < commit_index:
             try:
@@ -191,8 +210,8 @@ class RaftCore:
                     self.applied_index += 1
                     entry = self.log[self.applied_index]
                     # 如果文件修改成功，再保存日志
-                    if entry['type'] in ['add','update','delete']:
-                        await self.save_log_file(entry,commit_index)
+                    if entry['type'] in ['add', 'update', 'delete']:
+                        await self.save_log_file(entry, commit_index)
                     # 如果两个操作都成功，提交并结束
                     retries = 0
             except IOError as e:
@@ -209,41 +228,39 @@ class RaftCore:
                 print(f"applied_by_commitIndex函数里: {e}")
                 break
 
-
-    def replicate_to_follower(self, follower_id):
-        try:
-            # with self.replicate_to_follower_lock:
-            # print(f'外部self.queues_dict,{self.queues_dict}==={follower_id}')
-            if follower_id not in self.next_index or self.next_index.get(follower_id)==None:
-                # print(f'len(self.log):{len(self.log)}')
-                self.next_index[follower_id]=len(self.log)
-            # print(f'{self.next_index}====={follower_id}')
-            leader_next_index = self.next_index[follower_id]
-            # print(leader_next_index,'leader_next_index')
-            leader_prev_log_index = leader_next_index - 1
-            leader_prev_log_term = self.log[leader_prev_log_index]['term'] if leader_prev_log_index >= 0 else -1
-            entries = self.log[leader_next_index:] if (len(self.log) > 0 and leader_next_index < len(self.log)) else []
-            # if follower_id=='server4':
-            # print(f'replicate_to_follower里的self.queues_dict:{self.queues_dict}，follower_id：{follower_id}')
-            self.queues_dict[follower_id].put(('replicate_logs_request', self.current_term, self.leader_id,
-                                               leader_prev_log_index, leader_prev_log_term, entries, self.commit_index))
-        except Exception as e:
-            print(f'replicate_to_follower里的错误:{e}')
+    async def replicate_to_follower(self, follower_id, leader_next_index=None):
+        async with self.replicate_to_follower_lock:
+            try:
+                if leader_next_index is None:
+                    leader_next_index = len(self.log)
+                leader_prev_log_index = leader_next_index - 1
+                leader_prev_log_term = self.log[leader_prev_log_index]['term'] if leader_prev_log_index >= 0 else -1
+                entries = self.log[leader_next_index:] if (
+                            len(self.log) > 0 and leader_next_index < len(self.log)) else []
+                # print(f'entries:{entries},leader_prev_log_index:{leader_prev_log_index},log:{self.log},entries:{entries}')
+                asyncio.create_task(self.put_message_to_host(follower_id, (
+                    'replicate_logs_request', self.current_term, self.leader_id, leader_prev_log_index,
+                    leader_prev_log_term,
+                    entries, self.commit_index)))
+            except Exception as e:
+                print(f'replicate_to_follower里的错误: {e}')
 
     async def resolve_follower_replicate_response(self, response):
-        follower_id = response['follower_id']
-        if response['success']:
-            # print('领导接收到同步的响应')
-            self.update_match_and_next_index(follower_id)
-            await self.check_commit()
-        elif response['term'] > self.current_term:
-            # follower比leader的任期大，说明该leader已经过时了
-            self.current_term = response['term']
-            self.state = 'FOLLOWER'
-        elif 'conflict_index' in response and response.get('conflict_index')!=None:
-            self.next_index[follower_id] = response['conflict_index']
-            # 改变了next_index，再次尝试同步
-            self.replicate_to_follower(follower_id)
+        async with self.resolve_follower_replicate_response_lock:
+            follower_id = response['follower_id']
+            if response['success']:
+                # print('领导接收到同步的响应,执行check_commit')
+                self.update_match_and_next_index(follower_id)
+                await self.check_commit()
+            elif response['term'] > self.current_term:
+                # follower比leader的任期大，说明该leader已经过时了
+                self.current_term = response['term']
+                self.state = 'FOLLOWER'
+            elif 'conflict_index' in response and response.get('conflict_index') != None:
+                self.next_index[follower_id] = response['conflict_index']
+                # 改变了next_index，再次尝试同步
+                print(f'conflict_index为{response["conflict_index"]}=>前移next_index')
+                asyncio.create_task(self.replicate_to_follower(follower_id, response['conflict_index']))
 
     async def check_commit(self):
         n = len(self.peers)  # 集群中节点的总数
@@ -252,7 +269,7 @@ class RaftCore:
             if count > n // 2 and i > self.commit_index:  # 确保新的 commit_index 大于原来的 commit_index
                 self.commit_index = i  # 更新 commit_index
                 print('更新leader的commit_index为', self.commit_index)
-                await self.applied_by_commitIndex(self.commit_index)  # 提交并应用日志到状态机
+                asyncio.create_task(self.applied_by_commitIndex(self.commit_index))
                 break  # 一旦找到符合条件的日志条目，更新并退出
 
     def update_match_and_next_index(self, follower_id):
@@ -262,26 +279,34 @@ class RaftCore:
         self.match_index[follower_id] = leader_prev_log_index + len(entries)
         self.next_index[follower_id] = self.match_index[follower_id] + 1
 
-    def send_vote(self, term, candidate_id, last_log_index, last_log_term):
-        vote_granted = False
-        if term < self.current_term:
+    async def send_vote(self, term, candidate_id, last_log_index, last_log_term):
+        # print(f'{self.id}收到了{candidate_id}的投票邀请')
+        async with self.send_vote_lock:
             vote_granted = False
-
-        # 如果候选人的任期更大，更新自己的任期并投票
-        elif term >= self.current_term:
-            # 只有在未投过票并且候选人的日志条目更长或相等时，才投票
-            if (not self.voted_for) and self.is_candidate_log_valid(last_log_index, last_log_term):
-                # 收到了任期更大的投票请求
-                if self.state == 'LEADER':
-                    self.state = 'FOLLOWER'
+            if term < self.current_term:
+                vote_granted = False
+            if term > self.current_term:
+                self.state = 'FOLLOWER'
                 # 将候选人的term更新为自己的current_term
                 self.current_term = term
-                self.voted_for = candidate_id
-                vote_granted = True
-            else:
-                vote_granted = False
-        # print(f'投票结果：投票者:{self.id},投票者的任期:{self.current_term},是否投票:{vote_granted}')
-        self.queues_dict[candidate_id].put(('vote_request_response', self.current_term, vote_granted))
+                self.voted_for = None
+                self.leader_id = None
+            # 如果候选人的任期更大，更新自己的任期并投票
+            if term >= self.current_term:
+                # 只有在未投过票并且候选人的日志条目更长或相等时，才投票
+                if (not self.voted_for) and self.is_candidate_log_valid(last_log_index, last_log_term):
+                    # 收到了任期更大的投票请求
+                    if self.state == 'LEADER':
+                        self.state = 'FOLLOWER'
+                    # 将候选人的term更新为自己的current_term
+                    self.current_term = term
+                    self.voted_for = candidate_id
+                    vote_granted = True
+                else:
+                    vote_granted = False
+            print(f'投票者:{self.id}给{candidate_id}在{term}期,是否投票:{vote_granted}')
+            await self.put_message_to_host(candidate_id,
+                                           ('vote_request_response', self.id, self.current_term, vote_granted))
 
     def is_candidate_log_valid(self, last_log_index, last_log_term):
         """
@@ -299,34 +324,35 @@ class RaftCore:
             return True
         return False
 
-    async def handle_vote_request_response(self, follower_term, flag):
+    async def handle_vote_request_response(self, follower_id, follower_term, flag):
         if self.state != 'CANDIDATE':
             return
-        # print(f'正在执行{self.id}的投票响应:{self.current_term}___{follower_term}', )
+        print(f'候选人收到了{follower_id}的投票响应:{flag}')
         if self.current_term >= follower_term:
-            self.current_votes_received.append(flag)
-            if sum(self.current_votes_received) >= len(self.peers) / 2:
+            self.current_votes_received[follower_id] = flag
+            votes_for_me = sum(flag for flag in self.current_votes_received.values())
+            if votes_for_me >= len(self.peers) / 2:
                 self.state = 'LEADER'
-                self.current_votes_received = []
+                self.current_votes_received = {}
                 await self.start_leader()
             elif len(self.current_votes_received) == len(self.peers):
-                self.current_votes_received = []
+                self.current_votes_received = {}
                 self.state = 'FOLLOWER'
         else:
             # print(f"{self.id} 接收到更新的任期{follower_term}，所以切换到Follower")
             self.current_term = follower_term
             self.state = 'FOLLOWER'
-            self.current_votes_received = []
+            self.current_votes_received = {}
 
-    async def run(self,sibling_pids_dict,new_add=False):
-        self.new_add=new_add
-        self.sibling_pids_dict=sibling_pids_dict
+    async def run(self, new_add=False):
+        self.new_add = new_add
+        # self.sibling_pids_dict=sibling_pids_dict
         # print('node 哈哈哈')
         loop = asyncio.get_event_loop()
         self.run_loop = loop
         task1 = asyncio.create_task(self.run_core())
         task1.set_name('run_core')
-        task2 = asyncio.create_task(self.get_message(loop))
+        task2 = asyncio.create_task(self.get_message())
         task2.set_name('get_message')
         await asyncio.gather(task1, task2)
 
@@ -335,10 +361,10 @@ class RaftCore:
         # print(f'msg_type:{msg_type}')
         if msg_type == 'vote_request':
             term, candidate_id, last_log_index, last_log_term = msg[1], msg[2], msg[3], msg[4]
-            self.send_vote(term, candidate_id, last_log_index, last_log_term)
+            await self.send_vote(term, candidate_id, last_log_index, last_log_term)
         elif msg_type == 'vote_request_response':
-            follower_term, flag = msg[1], msg[2]
-            await self.handle_vote_request_response(follower_term, flag)
+            follower_id, follower_term, flag = msg[1], msg[2], msg[3]
+            await self.handle_vote_request_response(follower_id, follower_term, flag)
         elif msg_type == 'replicate_logs_request':
             _, leader_term, leader_id, leader_prev_log_index, leader_prev_log_term, entries, leader_commit_index = msg
             # print('11111111111')
@@ -353,71 +379,78 @@ class RaftCore:
             # raft算法相关的主机通信
             await self.process_raft_msg(msg)
             return
-        elif msg_type in ['send_new_pid','send_all_pid']:
-            self.resolve_pid_msg(msg)
-    def resolve_pid_msg(self,msg):
+
+
+    def remove_peer_by_id(self, node_id):
+        self.peers[:] = [peer for peer in self.peers if peer.id != node_id]
+
+    async def resolve_node_msg(self, msg):
         msg_type = msg[0]
-        if msg_type=='send_new_pid':
-            new_pid=msg[1]
-            self.sibling_pids_dict[new_pid]=new_pid
-            for peer in self.peers:
-                if peer.id!=self.leader_id:
-                    self.queues_dict[peer.id].put(('send_all_pid'),self.sibling_pids_dict)
-        elif msg_type=='send_all_pid':
-            new_sibling_pids_dict=msg[1]
-            self.sibling_pids_dict = new_sibling_pids_dict
-        elif msg_type=='leader_add_success':
+        if msg_type == 'leader_send_new_server':
+            print('其他节点收到了leader_add_success')
+            new_node = msg[1]
+            self.peers.append(FakeNode(new_node))
+        elif msg_type == 'leader_add_success':
             print('领导收到了leader_add_success')
             if self.new_add:
-                # 给leader发送自己的pid
-                pid = os.getpid()
-                self.queues_dict[self.leader_id].put(('send_new_pid', pid))
-                self.new_add=False
+                self.new_add = False
+        elif msg_type == 'dead':
+            print('其他节点收到了dead_node')
+            dead_node_id = msg[1]
+            if self.id == dead_node_id:
+                print('我死了')
+                self.is_dead = True
+            else:
+                self.remove_peer_by_id(dead_node_id)
 
-    def get_message_core(self, loop):
-        while True:
-            try:
-                msg = self.queues_dict[self.id].get()
-                asyncio.run_coroutine_threadsafe(self.process_message(msg), loop)
-            except queue.Empty:
-                pass  # 如果队列为空，则继续等待
-
-    async def get_message(self, loop):
-        coro = asyncio.to_thread(self.get_message_core, loop)
-        task = asyncio.create_task(coro)
-        await task
+    async def get_message(self):
+        while True and not self.is_dead:
+            message = await self.server.get_host_message()
+            await self.process_message(message)
 
     async def run_core(self):
         if self.state == 'FOLLOWER':
             await self.run_follower()
 
     async def run_follower(self):
-        while True:
-            # print(f'{self.id}活着')
+        while True and not self.is_dead:
             try:
                 await asyncio.wait_for(self.heartbeat_received.wait(), timeout=self.election_timeout)
-                # print(f'{self.id}执行了心跳')
             except asyncio.TimeoutError:
-                if self.state == 'FOLLOWER' and not self.new_add:
-                    self.become_candidate()
+                if self.state == 'FOLLOWER' and not self.is_new:
+                    await self.become_candidate()
             finally:
                 self.election_timeout = self.get_random_election()
 
     def get_random_election(self):
-        return random.uniform(150, 500) / 1000
+        return random.uniform(150, 300) / 1000
+        # return random.uniform(750, 1000) / 100
+
+    async def put_message_to_host(self, address_id, message_tuple):
+        try:
+            await self.server.send_host_message(address_id, message_tuple)
+        except Exception as e:
+            print(f'message_tuple:{message_tuple}==>{e}')
+
+
+
+
 class RaftNode(RaftCore):
     pending_requests = queue.Queue()
     process_client_request = False
 
-    def __init__(self, node_id, queues_dict):
-        super().__init__(node_id, queues_dict)
-        self.get_file_cache_lock =asyncio.Lock()
+    def __init__(self, node_id, server, is_new):
+        super().__init__(node_id, server, is_new)
+        self.modify_file_dict = {}
+        self.receive_client_lock = asyncio.Lock()
+        self.get_file_cache_lock = asyncio.Lock()
         self.requests_dict = {}
         self.cache = self.init_lfu_cache()
         self.applied_index_dict = {}
         self.tasks_dict = {}
-        self.response_index=-1
-        self.is_change_file= {}
+        self.response_index = -1
+        self.is_change_file = {}
+
     def init_lfu_cache(self):
         k = 40
         m = 60
@@ -426,8 +459,7 @@ class RaftNode(RaftCore):
         my_lfu_cache.schedule_exit(m)
         return my_lfu_cache
 
-    def set_peers(self, peers):
-        self.peers = peers
+
     async def process_message(self, msg):
         msg_type = msg[0]
         await super().process_message(msg)
@@ -436,65 +468,71 @@ class RaftNode(RaftCore):
             await self.process_server_update_msg(msg)
         elif msg_type in ['mediator_send_msg_get', 'get_file_cache', 'send_file_cache', 'delete_cache',
                           'mediator_send_msg_modified']:
-            # 文件修改的信息
-            # print(msg_type,'>>>>>>>>>')
             await self.process_operate_file_msg(msg)
-
+        elif msg_type in ['leader_add_success', 'leader_add_success', 'dead']:
+            await self.resolve_node_msg(msg)
+        elif msg_type in ['load_send_peers']:
+            await self.resolve_load_msg(msg)
 
     async def modify_file_by_log(self, entry):
-
-            method = entry.get('type')
-            file_path = entry.get('file_path')
-            if method == 'add':
-                properties_dict = entry['properties_dict']
-                await add_file(file_path, properties_dict, self.id)
-            elif method == 'delete':
-                await delete_file(file_path, self.id)
-            elif method == 'update':
-                properties_dict = json.loads(entry['properties_dict'])
-                await update_file(file_path, properties_dict, self.id)
-            try:
-                if file_path in self.is_change_file and isinstance(self.is_change_file[file_path],list):
-                    self.is_change_file[file_path].pop(0)
-                    if len(self.is_change_file[file_path])==0:
-                        del self.is_change_file[file_path]
-            except Exception as e:
-                print(f'modify_file_by_log里add的错误：{e}')
-
+        method = entry.get('type')
+        file_path = entry.get('file_path')
+        if method == 'add':
+            properties_dict = entry['properties_dict']
+            await add_file(file_path, properties_dict, self.id)
+        elif method == 'delete':
+            await delete_file(file_path, self.id)
+        elif method == 'update':
+            properties_dict = json.loads(entry['properties_dict'])
+            await update_file(file_path, properties_dict, self.id)
+        try:
+            if file_path in self.is_change_file and isinstance(self.is_change_file[file_path], list):
+                self.is_change_file[file_path].pop(0)
+                if len(self.is_change_file[file_path]) == 0:
+                    del self.is_change_file[file_path]
+        except Exception as e:
+            print(f'modify_file_by_log里add的错误：{e}')
 
     async def receive_client_core(self, request_id):
         try:
-            operate_str, client_id,timestamp,node_id=self.requests_dict.get(request_id)
-            params = resolve_client(operate_str=operate_str)
-            file_path = params['file_path']
-            op = params['op']
-            properties_dict = params['properties_dict']
-            if op != 'get':
-                file_exist=os.path.exists(f'{self.id}/{file_path}')
-                if (op=='add' and file_exist) or (op=='delete' and not file_exist):
-                    self.queues_dict['Mediator'].put(('server_send_response',request_id))
-                    self.queues_dict[client_id].put(('server_send_response', '错误的操作指令',operate_str,request_id))
-                    return
-                if file_path not in self.is_change_file:
-                    self.is_change_file[file_path]=[timestamp]
-                else:
-                    self.is_change_file[file_path].append(timestamp)
-                temp_log = self.genLog(op, client_id,request_id,file_path,timestamp, properties_dict)
-                print('准备同步新增日志了')
-                await self.replicate_logs(temp_log)
+            async with self.receive_client_lock:
+                operate_str, client_id, timestamp, node_id = self.requests_dict.get(request_id)
+                params = resolve_client(operate_str=operate_str)
+                file_path = params['file_path']
+                op = params['op']
+                properties_dict = params['properties_dict']
+                if op != 'get':
+                    file_exist = os.path.exists(f'{self.id}/{file_path}')
+                    if (op == 'add' and file_exist) or (op == 'delete' and not file_exist):
+                        # asyncio.create_task(self.put_message_to_host('Mediator', ('server_send_response', request_id)))
+                        asyncio.create_task(self.put_message_to_host(client_id,
+                                                                     ('server_send_response', '错误的操作指令',
+                                                                      operate_str, request_id)))
+                        return
+                    if file_path not in self.modify_file_dict:
+                        self.modify_file_dict[file_path] = [{'timestamp': timestamp, 'get_arr': []}]
+                    else:
+                        self.modify_file_dict[file_path].append({'timestamp': timestamp, 'get_arr': []})
+                    # if file_path not in self.is_change_file:
+                    #     self.is_change_file[file_path] = [timestamp]
+                    # else:
+                    #     self.is_change_file[file_path].append(timestamp)
+                    temp_log = self.genLog(op, client_id, request_id, file_path, timestamp, properties_dict)
+                    print('准备同步新增日志了')
+                    await self.replicate_logs(temp_log)
         except Exception as e:
             print(f'receive_client_core里的错:{e}')
 
-    def genLog(self, method, client_id,request_id,file_path,timestamp, content):
-        temp={}
+    def genLog(self, method, client_id, request_id, file_path, timestamp, content):
+        temp = {}
         if method == 'update' or method == 'add':
             temp_content = json.dumps(content)
             if method == 'add':
-                temp={
+                temp = {
                     "properties_dict": temp_content,
                 }
             else:
-                temp={
+                temp = {
                     "properties_dict": temp_content,
                 }
         return {
@@ -503,63 +541,126 @@ class RaftNode(RaftCore):
             "type": method,
             "timestamp": timestamp,
             "leader_id": self.id,
-            "client": client_id,
-            "request_id":request_id,
+            "communicate": client_id,
+            "request_id": request_id,
             "file_path": file_path,
             **temp,
         }
+
+    async def get_disk_file(self, file_path):
+        if not os.path.exists(f'{self.leader_id}/{file_path}'):
+            return None
+        async with aiofiles.open(f'{self.leader_id}/{file_path}', 'r') as source_file:
+            file_content = await source_file.read()  # 异步读取源文件
+            return file_content
+        # while True:
+        #     try:
+        #         if file_path not in self.is_change_file or (self.is_change_file.get(file_path) and self.is_change_file[file_path][0] > timestamp):
+        #             async with aiofiles.open(f'{self.id}/{file_path}', 'r') as source_file:
+        #                 file_content = await source_file.read()  # 异步读取源文件
+        #                 return file_content
+        #         await asyncio.sleep(1)
+        #     except FileNotFoundError:
+        #         print(f"文件找不到")
+        #         return None
+        #     except Exception as e:
+        #         print(f"读取{file_path}发生错误: {e}")
+        #         return None
 
     async def process_operate_file_msg(self, msg):
         msg_type = msg[0]
         # 处理查询逻辑
         if msg_type == 'mediator_send_msg_get':
-            # 当我们拿到锁后，判断是否有缓存
-            _, request_id, operate_str, client_id,timestamp,node_id = msg
-            self.requests_dict[request_id]=(operate_str, client_id,timestamp,node_id)
-            # print(f'存储了self.requests_dict中的{request_id}为{operate_str, client_id, timestamp}')
+            print(f'服务器收到一条mediator_send_msg_get消息')
+            _, request_id, operate_str, client_id, timestamp, node_id = msg
+            self.requests_dict[request_id] = (operate_str, client_id, timestamp, node_id)
             params = resolve_client(operate_str)
             file_path = params.get('file_path')
-            # 使用 setdefault() 保证对于每个 file_path 都有一个唯一的锁
+            # 使用 setdefault() 保证对于每个 file_path 都有一个唯一的锁,
             lock = self.tasks_dict.setdefault(file_path, asyncio.Lock())
-            # print('mediator_send_msg_get')
             # 等待获取锁，保证同一时间只有一个线程处理该 file_path
             async with lock:
                 file_content = self.cache.visitFile(file_path)
+                print(f'缓存中{file_path}的文件内容为：{file_content}==》{self.id} == {self.leader_id}')
                 if file_content:
-                    # print('缓存次数')
-                    self.get_success(request_id, file_content)
+                    print(f'响应成功，走的缓存=》{operate_str}==>{file_content}')
+                    asyncio.create_task(self.get_success(request_id, file_content))
+                elif self.id == self.leader_id:
+                    print(f'leader处理查询操作')
+                    try:
+                        if file_path in self.modify_file_dict:
+                            # 找到最近的修改请求
+                            latest_modify_entry = None
+
+                            for entry in reversed(self.modify_file_dict[file_path]):
+                                if entry['timestamp'] <= timestamp:
+                                    latest_modify_entry = entry
+                                    break
+
+                            if latest_modify_entry:
+                                latest_modify_entry['get_arr'].append(request_id)
+                            # 将处理逻辑转到修改完成后执行
+                            return
+                        # 当前文件不处于编辑态，可以查询
+                        file_content = await self.get_disk_file(file_path)
+                        if not file_content:
+                            print(f'leader给客户端发送文件不存在的响应,之前并无更改操作：{operate_str}')
+                            asyncio.create_task(self.put_message_to_host(client_id,
+                                                                         ('server_send_response', '文件不存在',
+                                                                          operate_str, request_id)))
+                            return
+                        self.cache.insert_in_dict(file_path, file_content)
+                        print(f'领导将文件内容插入缓存')
+                    except Exception as e:
+                        print(f'领导查询文件内容出错')
+                    # print(f'文件查询次数:{file_content}')
+                    asyncio.create_task(self.get_success(request_id, file_content))
                 else:
-                    self.queues_dict[self.leader_id].put(('get_file_cache', file_path, request_id,timestamp,node_id))
+                    asyncio.create_task(self.put_message_to_host(self.leader_id,
+                                                                 ('get_file_cache', operate_str, client_id, file_path,
+                                                                  request_id, timestamp, node_id)))
+
         elif msg_type == 'get_file_cache':
-            # print(f'222222接收其他主机的查找请求')
             try:
                 async with self.get_file_cache_lock:
-                    _, file_path, request_id,timestamp,node_id = msg
-                    while True:
-                        if  file_path not in self.is_change_file or (self.is_change_file[file_path] and self.is_change_file[file_path][0]>timestamp):
-                            # 已经是最新的
-                            # print(f'处理请求{request_id}——{file_path}')
-                            async with aiofiles.open(f'{self.id}/{file_path}', 'r') as source_file:
-                                file_content = await source_file.read()  # 异步读取源文件
-                                # print(f'333333333找到内容，发送给其他主机的查找请求：{file_content}')
-                                self.queues_dict[node_id].put(('send_file_cache', file_content, request_id))
+                    _, operate_str, client_id, file_path, request_id, timestamp, node_id = msg
+                    # 给leader主机也储存相关信息，等修改完成后，也可以获取
+                    self.requests_dict[request_id] = (operate_str, client_id, timestamp, node_id)
+                    if file_path in self.modify_file_dict:
+                        # 找到最近的修改请求
+                        latest_modify_entry = None
+                        for entry in reversed(self.modify_file_dict[file_path]):
+                            if entry['timestamp'] <= timestamp:
+                                latest_modify_entry = entry
                                 break
-                        # print(f'{file_path}还没有完成修改动作==>{self.is_change_file.get(file_path)}')
-                        await asyncio.sleep(0.1)
+
+                        if latest_modify_entry:
+                            latest_modify_entry['get_arr'].append(request_id)
+                        # 将处理逻辑转到修改完成后执行
+                        return
+                    # 当前文件不处于编辑态，可以查询
+                    file_content = await self.get_disk_file(file_path)
+                    asyncio.create_task(
+                        self.put_message_to_host(node_id, ('send_file_cache', file_content, request_id)))
             except Exception as e:
                 print(f'process_operate_file_msg里的错误：{e}')
-
         elif msg_type == 'send_file_cache':
-            # print(f'444444444接收leader主机的文件内容')
+            # 其他节点获得了leader查找的文件内容
             try:
                 _, file_content, request_id = msg
-                # print(f'self.requests_dict.get(request_id):{self.requests_dict.get(request_id)}==={request_id}')
-                operate_str, client_id,timestamp,node_id=self.requests_dict.get(request_id)
+                operate_str, client_id, timestamp, node_id = self.requests_dict.get(request_id)
+
+                if not file_content:
+                    print('其他主机说文件不存在！！！！')
+                    asyncio.create_task(self.put_message_to_host(client_id,
+                                                                 ('server_send_response', '文件不存在',
+                                                                  operate_str, request_id)))
+                    return
                 params = resolve_client(operate_str)
                 file_path = params.get('file_path')
                 self.cache.insert_in_dict(file_path, file_content)
                 # print(f'文件查询次数:{file_content}')
-                self.get_success(request_id, file_content)
+                asyncio.create_task(self.get_success(request_id, file_content))
             except Exception as e:
                 print(f'send_file_cache里的错误：{e}')
         elif msg_type == 'delete_cache':
@@ -569,20 +670,20 @@ class RaftNode(RaftCore):
             # 先同步日志
             print('领导接收到更改消息')
             try:
-                _, request_id, operate_str, client_id, timestamp,leader_id = msg
-                if leader_id!=self.id:
-                    self.queues_dict['Mediator'].put(('server_send_response', request_id,False))
+                _, request_id, operate_str, client_id, timestamp, leader_id = msg
+                if leader_id != self.id:
+                    await self.put_message_to_host('Mediator', ('server_send_response', request_id, False))
                     return
-                self.requests_dict[request_id]=(operate_str, client_id,timestamp,self.leader_id)
+                self.requests_dict[request_id] = (operate_str, client_id, timestamp, self.leader_id)
                 await self.receive_client_core(request_id)
-            except Exception as e :
+            except Exception as e:
                 print(f'mediator_send_msg_modified出错了,{e}')
 
     async def process_server_update_msg(self, msg):
         msg_type = msg[0]
         if msg_type == 'leader_add_server':
             print('111接收到leader_add_server消息')
-            _, request_id, new_node_id,queues_dict = msg
+            _, request_id, new_node_id = msg
             temp_log = {
                 "index": len(self.log),
                 "term": self.current_term,
@@ -590,12 +691,11 @@ class RaftNode(RaftCore):
                 "timestamp": time.time(),
                 "leader_id": self.id,
                 "node_id": new_node_id,
-                "request_id":request_id,
-                "queues_dict":queues_dict
+                "request_id": request_id
             }
             await self.replicate_logs(temp_log)
         elif msg_type == 'leader_remove_server':
-            _, request_id, remove_node_id, queues_dict = msg
+            _, request_id, remove_node_id = msg
             temp_log = {
                 "index": len(self.log),
                 "term": self.current_term,
@@ -603,114 +703,171 @@ class RaftNode(RaftCore):
                 "timestamp": time.time(),
                 "leader_id": self.id,
                 "node_id": remove_node_id,
-                "request_id": request_id,
-                "queues_dict": queues_dict
+                "request_id": request_id
             }
             await self.replicate_logs(temp_log)
 
-    def get_success(self, request_id, file_content=None):
+    async def get_success(self, request_id, file_content=None):
         try:
             # print(f'111111111111self.requests_dict.get(request_id):{self.requests_dict}---{request_id}')
-            operate_str, client_id,timestamp,node_id=self.requests_dict.get(request_id)
+            operate_str, client_id, timestamp, node_id = self.requests_dict.get(request_id)
             params = resolve_client(operate_str)
             if file_content:
                 properties = params.get('properties')
                 content_dict = json.loads(file_content)
                 result = {key: content_dict.get(key, None) for key in properties}
-                # self.queues_dict['Mediator'].put(('server_send_response',request_id))
-                # print('总次数')
-                self.queues_dict[client_id].put(('server_send_response', json.dumps(result),operate_str,request_id))
+                print(f'给客户端发送成功<<查询>>消息,{operate_str}==>{result}')
+
+                try:
+                    asyncio.create_task(self.put_message_to_host(client_id, ('server_send_response', json.dumps(result),
+                                                                             operate_str, request_id)))
+                except Exception as e:
+                    print(f'给客户端发送成功<<查询>>消息处理错误：e')
             else:
-                self.queues_dict[client_id].put(('server_send_response','文件操作成功',operate_str,request_id))
+                print('给客户端发送成功<<修改>>消息')
+                asyncio.create_task(self.put_message_to_host(client_id,
+                                                             ('server_send_response', f'文件操作成功', operate_str,
+                                                              request_id)))
             # print(f'删除了{request_id}')
             del self.requests_dict[request_id]
         except Exception as e:
             print(f'get_success中的错误：{e}')
 
-    def response_by_commit_index(self,current_commit_index):
+    async def response_by_commit_index(self, current_commit_index):
         while self.response_index < current_commit_index:
             try:
-                self.response_index=self.response_index+1
-                if self.response_index>=len(self.log):
+                self.response_index = self.response_index + 1
+                if self.response_index >= len(self.log):
                     break
-                entry=self.log[self.response_index]
-                request_id=entry['request_id']
-                self.queues_dict['Mediator'].put(('server_send_response', request_id,True))
+                entry = self.log[self.response_index]
+                request_id = entry['request_id']
+                # await self.put_message_to_host('Mediator', ('server_send_response', request_id, True))
             except Exception as e:
-                print('response_by_commit_index里的问题',e)
+                print('response_by_commit_index里的问题', e)
                 self.response_index = self.response_index - 1
 
-    async def applied_by_commitIndex(self, current_commit_index,max_retries=5):
-        if self.id==self.leader_id:
-            self.response_by_commit_index(current_commit_index)
+    async def applied_by_commitIndex(self, current_commit_index, max_retries=5):
         retries = 0
         while self.applied_index < current_commit_index:
-            # try:
-            async with self.apply_lock:  # 确保操作互斥
-                # 增量写入日志
-                self.applied_index += 1
-                # if self.id != self.leader_id:
+            try:
+                async with self.apply_lock:  # 确保操作互斥
+                    # if self.id != self.leader_id:
+                    # print(f'其他节点---{self.applied_index}与{current_commit_index}---{self.log}')
+                    # 增量写入日志
+                    self.applied_index += 1
+                    # if self.id != self.leader_id:
                     # print(f'中部---是其他节点在apply, {self.applied_index} === {current_commit_index}==={len(self.log)}')
-                if self.applied_index>=len(self.log):
-                    return
-                entry = self.log[self.applied_index]
-                type=entry['type']
-                if type in ['add', 'update', 'delete']:
-                    await asyncio.gather(
-                        self.modify_file_by_log(entry),  # 子类可能有不同的实现
-                        super().save_log_file(entry,current_commit_index)  # 保存日志
-                    )
-                    if self.leader_id==self.id:
-                        request_id=entry['request_id']
-                        self.get_success(request_id)
-                    continue
-                await asyncio.gather(
-                    self.update_server(type, entry),
-                    super().save_log_file(entry, current_commit_index)  # 保存日志
-                )
-                # 如果两个操作都成功，提交并结束
-                retries = 0
-            # except IOError as e:
-            #     # 如果出错，回滚索引并重试
-            #     print('IOError出错了',e)
-            #     async with self.apply_lock:  # 确保操作互斥
-            #         self.applied_index -= 1  # 回滚索引
-            #         retries += 1
-            #         if retries >= max_retries:
-            #             print(f"Failed to apply log after {max_retries} retries.")
-            #             break  # 达到最大重试次数，跳出
+                    if self.applied_index >= len(self.log):
+                        return
+                    entry = self.log[self.applied_index]
+                    type = entry['type']
+                    if type in ['add', 'update', 'delete']:
+                        print(f'主机：{self.id}正在修改文件')
+                        await asyncio.gather(
+                            self.modify_file_by_log(entry),  # 子类可能有不同的实现
+                            super().save_log_file(entry, current_commit_index)  # 保存日志
+                        )
+                        if entry['file_path'] in self.modify_file_dict:
+                            await self.execute_get_by_modify_done(entry['file_path'], entry['timestamp'])
+                        print(f'主机：{self.id}已经把日志存入文件')
+                        if self.leader_id == self.id:
+                            request_id = entry['request_id']
+                            asyncio.create_task(self.get_success(request_id))
+                        continue
+                    else:
+                        # 集群增减
+                        await super().save_log_file(entry, current_commit_index)
+                        if self.leader_id == self.id:
+                            self.update_server(type, entry)
+                            # asyncio.create_task(
+                            #     self.put_message_to_host(address[3], ('server_send_response', 'remove_server')))
+                            asyncio.create_task(
+                                self.put_message_to_host('Mediator', ('server_send_response', 'remove_server')))
+                    # 如果两个操作都成功，提交并结束
+                    retries = 0
+            except IOError as e:
+                # 如果出错，回滚索引并重试
+                print('IOError出错了', e)
+                async with self.apply_lock:  # 确保操作互斥
+                    self.applied_index -= 1  # 回滚索引
+                    retries += 1
+                    if retries >= max_retries:
+                        print(f"Failed to apply log after {max_retries} retries.")
+                        break  # 达到最大重试次数，跳出
                 # 可以加入延时或其他重试策略
-            # except Exception as e:
-            #     print(f"子类中applied_by_commitIndex的错误: {e}")
-            #     break
+            except Exception as e:
+                print(f"子类中applied_by_commitIndex的错误: {e}")
+                break
 
-    async def update_server(self,type,entry):
+    async def execute_get_by_modify_done(self, file_path, current_timestamp):
+        # 获取所有的修改请求
+        matched_request = next(
+            (entry for entry in self.modify_file_dict.get(file_path, []) if entry['timestamp'] == current_timestamp),
+            None  # 如果没有匹配的请求，返回 None
+        )
+        if not matched_request:
+            return
+        get_arr = matched_request.get('get_arr')
+        print(f'1111111111get_arr:{get_arr}')
+        for get_request_id in get_arr:
+            try:
+                # 执行 get 请求逻辑
+                operate_str, client_id, timestamp, node_id = self.requests_dict.get(get_request_id)
+                file_content = await self.get_disk_file(file_path)
+                if not file_content:
+                    print('leader修改了文件后说文件不存在')
+                    asyncio.create_task(self.put_message_to_host(client_id,
+                                                                 ('server_send_response', '文件不存在',
+                                                                  operate_str, get_request_id)))
+                    return
+                if node_id == self.leader_id:
+                    self.cache.insert_in_dict(file_path, file_content)
+                    await self.get_success(get_request_id, file_content)
+                else:
+                    asyncio.create_task(
+                        self.put_message_to_host(node_id, ('send_file_cache', file_content, get_request_id)))
+            except Exception as e:
+                print(f"处理 get 请求 {get_request_id} 时出错: {e}")
+
+        # 从 modify_file_dict 中移除已完成的请求
+        self.modify_file_dict[file_path].remove(matched_request)
+
+        # 如果对应文件的修改请求已为空，移除整个文件路径的键
+        if not self.modify_file_dict[file_path]:
+            del self.modify_file_dict[file_path]
+            print(f"移除文件路径 {file_path} 的所有修改请求")
+
+    def update_server(self, type, entry):
+        if self.id != entry['leader_id']:
+            return
         if type == 'add_server':
             node_id = entry['node_id']
-            if self.id==node_id:
+            if self.id == node_id:
                 return
-            self.queues_dict = entry["queues_dict"]
+            for peer in self.peers:
+                if peer.id != self.leader_id:
+                    print(f'给{peer.id}说添加兄弟')
+                    asyncio.create_task(self.put_message_to_host(peer.id, ('leader_send_new_server', node_id)))
             self.peers.append(FakeNode(node_id))
             # 让机器正式工作
-            self.queues_dict[node_id].put(('leader_add_success'))
-            # if self.id == self.leader_id:
-            #     print(f'tttttnode_id:{node_id}')
+            print('让机器正式工作')
+            asyncio.create_task(self.put_message_to_host(node_id, ('leader_add_success',)))
+            print('给中间层说添加成功')
+            asyncio.create_task(self.put_message_to_host('Mediator', ('server_send_response', 'add_server')))
+
         elif type == 'remove_server':
             dead_node_id = entry['node_id']
-            if self.id==dead_node_id:
-                # 自杀
-                subprocess.run(["taskkill", "/F", "/PID", str(os.getpid())])
-            self.queues_dict = entry["queues_dict"]
-            self.peers = [peer for peer in self.peers if peer.id != dead_node_id]
-            if self.id == self.leader_id:
-                # print(f'leader移除该节点的心跳传输:{self.sibling_pids_dict}')
-                dead_pid = self.sibling_pids_dict.get(dead_node_id)
-                if dead_pid:
-                    print('leader杀死节点', self.id, dead_node_id)
-                    subprocess.run(["taskkill", "/F", "/PID", str(dead_pid)])
-                    del self.sibling_pids_dict[dead_node_id]
-        # print(f'兄弟些: {self.peers}')
-        # print(f'节点被领导移除成功:{dead_node_id}')
+            leader_id = entry['leader_id']
+            if self.id == leader_id:
+                for peer in self.peers:
+                    if peer.id != leader_id:
+                        print(f'给{peer.id}说删除兄弟')
+                        asyncio.create_task(self.put_message_to_host(peer.id, ('dead', dead_node_id)))
+                self.peers = [peer for peer in self.peers if peer.id != dead_node_id]
+                # asyncio.create_task(self.put_message_to_host('Mediator', ('server_send_response', 'remove_server')))
 
-
-
+    async def resolve_load_msg(self, msg):
+        msg_type=msg[0]
+        if msg_type=='load_send_peers':
+            peers=msg[1]
+            self.set_peers(peers)

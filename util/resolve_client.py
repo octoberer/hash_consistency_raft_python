@@ -1,9 +1,5 @@
-import os
-
-
 
 all_operation=['add','update','get','delete']
-
 
 def resolve_client(operate_str):
     try:

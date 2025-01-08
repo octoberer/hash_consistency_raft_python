@@ -1,7 +1,5 @@
 import time
 
-import time
-
 
 class SnowflakeIdWorker:
     tw_epoch = 1288834974657  # Twitter's snowflake epoch
