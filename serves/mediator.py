@@ -1,7 +1,6 @@
 import asyncio
 import multiprocessing
 import time
-from collections import OrderedDict
 
 import psutil
 
@@ -80,9 +79,9 @@ class Mediator():
     async def execute_pending_task(self):
         # 执行队列里的没有执行的任务
         while True:
+            # print('中间层活着')
             try:
                 async with self.execute_pending_task_lock:
-                    # print('execute_pending_task', self.leader_id, len(self.pending_task_dict))
                     if self.leader_id and len(self.pending_task_dict) > 0:
                         waiting_task = self.get_waiting_task()
                         # print('waiting_task', waiting_task)
@@ -115,7 +114,9 @@ class Mediator():
             print(f"Error in running tasks: {e}")
 
     async def judge_leader_exit(self):
+
         while True:
+            # print('judge_leader_exit')
             try:
                 await asyncio.wait_for(self.heartbeat_received.wait(), timeout=self.leader_alive_timeout)
                 # print('replicate_logs_request===>中间层实现了心跳')
@@ -189,9 +190,7 @@ class Mediator():
         if op == 'delete' or op == 'update':
             # 先删除所有节点的file_path的缓存
             for peer in self.nodes:
-                # print('peer',peer)
                 self.queues_dict[peer.id].put(('delete_cache', file_path))
-        # print('中间层总发送')
         if op == 'get':
             try:
                 node_id = self.balancer.get_server(file_path)
@@ -207,12 +206,7 @@ class Mediator():
     def process_servers_message(self, msg):
         msg_type = msg[0]
         request_id = msg[1]
-        # print(f'zzzzzrequest_id:{request_id}')
         if msg_type == 'server_send_response':
-            # message=self.pending_task_dict.get(request_id)[1]
-            # print(f'中间层接收到了server_send_response==>{message}')
-            # print(f'zzzzzrequest_id:{request_id}')
-            # _, request_id = msg
             if request_id == 'add_server':
                 try:
                     self.nodes.append(FakeNode(self.new_node_id))
@@ -242,20 +236,22 @@ class Mediator():
             print('process_clients_message的错误', e)
 
     async def add_server(self, new_node_id):
-        if self.leader_id:
-            pass
-            # 起一个进程表示新增的服务器节点
-            new_node_id = 'server' + str(new_node_id)
-            self.queues_dict[new_node_id] = self.new_queue
-            node_exists = any(peer.id == new_node_id for peer in self.nodes)
-            if node_exists:
-                print('已有该主机')
-                return
-            self.new_node_id = new_node_id
-            await self.add_pending_task(('add_server', new_node_id, '_', RequestStatus.WAITING, time.time()))
-        else:
-            print('暂无leader节点，请稍后add_server')
-        pass
+        try:
+            if self.leader_id:
+                pass
+                # 起一个进程表示新增的服务器节点
+                new_node_id = 'server' + str(new_node_id)
+                self.queues_dict[new_node_id] = self.new_queue
+                node_exists = any(peer.id == new_node_id for peer in self.nodes)
+                if node_exists:
+                    print('已有该主机')
+                    return
+                self.new_node_id = new_node_id
+                await self.add_pending_task(('add_server', new_node_id, '_', RequestStatus.WAITING, time.time()))
+            else:
+                print('暂无leader节点，请稍后add_server')
+        except Exception as e:
+                print('add_server的错误', e)
 
     async def remove_server(self, remove_node_id):
         if self.leader_id:
@@ -273,9 +269,11 @@ class Mediator():
 
     async def update_server(self):
         pass
-        await asyncio.sleep(2)
-        print('增加一台主机')
-        await self.add_server(6)
+        await asyncio.sleep(3)
+        # print('增加一台主机')
+        # await self.add_server(6)
+        # 删掉一台主机
+        await self.remove_server('server2')
 
     def start_process(self, new_node_id):
         try:
@@ -283,6 +281,6 @@ class Mediator():
             new_node.set_peers(self.nodes + [new_node])
             p = multiprocessing.Process(target=worker, args=(new_node,))
             p.start()
-            p.join()
+            # p.join()
         except Exception as e:
             print('start_process的错误', e)

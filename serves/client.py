@@ -82,7 +82,7 @@ class Client:
             self.receive_msg(params.get("tip", "暂无提示"))
         else:
             try:
-                # print(f'{self.client_id}客户端发送了一条消息')
+                print(f'{self.client_id}客户端发送了一条消息')
                 self.queues_dict['Mediator'].put(('client_send_msg', self.client_id, one_msg, time.time()))
             except queue.Full:
                 print('????queue.Full')
@@ -112,12 +112,15 @@ class Client:
                 self.receive_msg(f'操作响应===》{request_id}')
 
     async def client_do_core(self):
-        await asyncio.sleep(1)
-        # print('客户端发起请求')
-        await self.batch_test(50,True)
-        # await asyncio.sleep(3)
-        print('再次执行测试')
-        await self.batch_test(100)
+        try:
+            await asyncio.sleep(1)
+            # print('客户端发起请求')
+            await self.batch_test(50,True)
+            await asyncio.sleep(6)
+            print('再次执行测试')
+            await self.batch_test(100)
+        except Exception as e:
+            print(f"client_do_core有问题: {e}")
 
     async def client_init(self):
         # pass
@@ -201,7 +204,7 @@ class Client:
                 # 记录查询操作
                 operation_log.append(f"Re-Queried file: {json.dumps(query_data, indent=2)}")
 
-            await write_file_contents(files,operation_log,firstWrite)
+            # await write_file_contents(files,operation_log,firstWrite)
             # 输出所有文件最终内容
             # print("\nFinal file contents:")
             # for file in files:

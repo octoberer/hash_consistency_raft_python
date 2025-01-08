@@ -7,10 +7,10 @@ import random
 
 import aiofiles
 import asyncio
-from distributed.operate_file import add_file, delete_file, update_file, serve_num
-from distributed.serves.resolve_client import resolve_client
-from distributed.serves.util import create_log_file, save_config
-from lfu import lfu_cache
+from util.operate_file import add_file, delete_file, update_file
+from util.resolve_client import resolve_client
+from util import create_log_file, save_config
+from util.lfu_cache import lfu_cache
 
 class FakeNode():
     def __init__(self,node_id):
@@ -393,6 +393,7 @@ class RaftCore:
 
     async def run_follower(self):
         while True:
+            # print(f'{self.id}活着')
             try:
                 await asyncio.wait_for(self.heartbeat_received.wait(), timeout=self.election_timeout)
                 # print(f'{self.id}执行了心跳')

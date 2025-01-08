@@ -86,7 +86,6 @@ class lfu_cache:
 
     def insert_in_dict(self,key, file_content):
         try:
-            # print(f'55555555，{key}==》{self.time_dict}')
             if key not in self.time_dict:
                 self.time_dict[key]={'frequency':1,'visit_time': time.time()}
             key_frequency = self.time_dict[key]["frequency"]
@@ -104,22 +103,3 @@ class lfu_cache:
             self.min_frequency = value['frequency']
         except Exception as e:
             print(f'insert_in_dict里的错误：{e}')
-
-# filenames=['file1.txt','file2.txt','file3.txt','file4.txt']
-# k=2
-# m=6
-# my_lru_cache=lru_cache(k)
-# my_lru_cache.schedule_exit(m)
-# my_lru_cache.visitFile('file1.txt')
-# my_lru_cache.visitFile('file2.txt')
-# my_lru_cache.visitFile('file3.txt')
-# my_lru_cache.visitFile('file4.txt')
-# my_lru_cache.visitFile('file3.txt')
-# my_lru_cache.visitFile('file4.txt')
-# my_lru_cache.visitFile('file1.txt')
-# my_lru_cache.visitFile('file1.txt')
-# def temp():
-#     my_lru_cache.visitFile('file3.txt')
-# timer = threading.Timer(4,temp)
-# timer.start()
-# time.sleep(3)

@@ -6,7 +6,7 @@ import re
 import aiofiles
 import psutil
 
-from distributed.operate_file import serve_num
+from operate_file import serve_num
 
 
 def create_log_file(entry):
